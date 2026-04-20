@@ -188,9 +188,30 @@ impl MtmdContext {
     }
 
     /// Check whether non-causal attention mask is needed before `llama_decode`.
+    ///
+    /// This preserves the historical context-only query and uses the default
+    /// vision projector path. Use [`Self::decode_use_non_causal_for_chunk`] when
+    /// evaluating a concrete MTMD chunk so audio-only projectors can be handled
+    /// according to upstream llama.cpp's chunk-aware API.
     #[must_use]
     pub fn decode_use_non_causal(&self) -> bool {
-        unsafe { llama_cpp_sys_2::mtmd_decode_use_non_causal(self.context.as_ptr()) }
+        unsafe {
+            llama_cpp_sys_2::mtmd_decode_use_non_causal(
+                self.context.as_ptr(),
+                std::ptr::null(),
+            )
+        }
+    }
+
+    /// Check whether non-causal attention mask is needed for a specific chunk.
+    #[must_use]
+    pub fn decode_use_non_causal_for_chunk(&self, chunk: &MtmdInputChunk) -> bool {
+        unsafe {
+            llama_cpp_sys_2::mtmd_decode_use_non_causal(
+                self.context.as_ptr(),
+                chunk.chunk.as_ptr(),
+            )
+        }
     }
 
     /// Check whether the current model uses M-RoPE for `llama_decode`.
