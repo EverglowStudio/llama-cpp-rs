@@ -150,13 +150,14 @@ fn extract_lib_assets(out_dir: &Path, target_os: &TargetOs) -> Vec<PathBuf> {
 }
 
 fn macos_link_search_path() -> Option<String> {
-    let output = Command::new("clang")
+    let output = Command::new("xcrun")
+        .arg("clang")
         .arg("--print-search-dirs")
         .output()
         .ok()?;
     if !output.status.success() {
         println!(
-            "failed to run 'clang --print-search-dirs', continuing without a link search path"
+            "failed to run 'xcrun clang --print-search-dirs', continuing without a link search path"
         );
         return None;
     }
@@ -171,6 +172,116 @@ fn macos_link_search_path() -> Option<String> {
 
     println!("failed to determine link search path, continuing without it");
     None
+}
+
+fn apple_sdk_name(target_triple: &str, variant: &AppleVariant) -> &'static str {
+    match variant {
+        AppleVariant::MacOS => "macosx",
+        AppleVariant::Other if target_triple.contains("ios-sim") => "iphonesimulator",
+        AppleVariant::Other if target_triple.contains("ios") => "iphoneos",
+        AppleVariant::Other => "macosx",
+    }
+}
+
+fn apple_clang_target(target_triple: &str) -> String {
+    match target_triple {
+        "aarch64-apple-ios-sim" => "arm64-apple-ios-simulator".to_string(),
+        "x86_64-apple-ios" => "x86_64-apple-ios-simulator".to_string(),
+        _ => target_triple.to_string(),
+    }
+}
+
+fn apple_deployment_target(target_triple: &str) -> Option<String> {
+    if target_triple.contains("ios-sim") {
+        Some(
+            env::var("IPHONESIMULATOR_DEPLOYMENT_TARGET")
+                .or_else(|_| env::var("IPHONEOS_DEPLOYMENT_TARGET"))
+                .unwrap_or_else(|_| "16.0".to_string()),
+        )
+    } else if target_triple.contains("ios") {
+        Some(env::var("IPHONEOS_DEPLOYMENT_TARGET").unwrap_or_else(|_| "16.0".to_string()))
+    } else if target_triple.contains("darwin") {
+        env::var("MACOSX_DEPLOYMENT_TARGET").ok()
+    } else {
+        None
+    }
+}
+
+fn xcrun_sdk_path(sdk_name: &str) -> Option<String> {
+    let output = Command::new("xcrun")
+        .arg("--sdk")
+        .arg(sdk_name)
+        .arg("--show-sdk-path")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        println!("cargo:warning=failed to resolve Apple SDK path for {sdk_name}");
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+fn xcrun_find_tool(tool: &str) -> Option<String> {
+    let output = Command::new("xcrun")
+        .arg("--find")
+        .arg(tool)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        println!("cargo:warning=failed to resolve Apple tool path for {tool}");
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+fn clear_stale_apple_cmake_cache(
+    out_dir: &Path,
+    expected_c_compiler: Option<&str>,
+    expected_sdk: Option<&str>,
+    expected_deployment_target: Option<&str>,
+) {
+    let build_dir = out_dir.join("build");
+    let cache_path = build_dir.join("CMakeCache.txt");
+    let Ok(cache) = std::fs::read_to_string(&cache_path) else {
+        return;
+    };
+
+    let compiler_matches = expected_c_compiler
+        .map(|compiler| cache.contains(&format!("CMAKE_C_COMPILER:STRING={compiler}")))
+        .unwrap_or(true);
+    let sdk_matches = expected_sdk
+        .map(|sdk| cache.contains(&format!("CMAKE_OSX_SYSROOT:PATH={sdk}")))
+        .unwrap_or(true);
+    let deployment_matches = expected_deployment_target
+        .map(|deployment_target| {
+            cache.contains(&format!(
+                "CMAKE_OSX_DEPLOYMENT_TARGET:STRING={deployment_target}"
+            ))
+        })
+        .unwrap_or(true);
+
+    if !compiler_matches || !sdk_matches || !deployment_matches {
+        println!(
+            "cargo:warning=removing stale Apple CMake cache at {}",
+            build_dir.display()
+        );
+        if let Err(error) = std::fs::remove_dir_all(&build_dir) {
+            println!(
+                "cargo:warning=failed to remove stale Apple CMake cache at {}: {error}",
+                build_dir.display()
+            );
+        }
+    }
 }
 
 fn validate_android_ndk(ndk_path: &str) -> Result<(), String> {
@@ -232,6 +343,25 @@ fn main() {
     debug_log!("OUT_DIR: {}", out_dir.display());
     debug_log!("BUILD_SHARED: {}", build_shared_libs);
 
+    if let TargetOs::Apple(variant) = &target_os {
+        let sdk_path = xcrun_sdk_path(apple_sdk_name(&target_triple, variant));
+        let deployment_target = apple_deployment_target(&target_triple);
+        let clang_path = xcrun_find_tool("clang");
+        let clangxx_path = xcrun_find_tool("clang++");
+        if let Some(clang) = &clang_path {
+            env::set_var("CC", &clang);
+        }
+        if let Some(clangxx) = &clangxx_path {
+            env::set_var("CXX", &clangxx);
+        }
+        clear_stale_apple_cmake_cache(
+            &out_dir,
+            clang_path.as_deref(),
+            sdk_path.as_deref(),
+            deployment_target.as_deref(),
+        );
+    }
+
     // Make sure that changes to the llama.cpp project trigger a rebuild.
     let rebuild_on_children_of = [
         llama_src.join("src"),
@@ -288,6 +418,23 @@ fn main() {
             .header("wrapper_mtmd.h")
             .allowlist_function("mtmd_.*")
             .allowlist_type("mtmd_.*");
+    }
+
+    if let TargetOs::Apple(variant) = &target_os {
+        println!("cargo:rerun-if-env-changed=SDKROOT");
+        let sdk_name = apple_sdk_name(&target_triple, variant);
+        let sdk_path = xcrun_sdk_path(sdk_name)
+            .or_else(|| env::var("SDKROOT").ok().filter(|value| !value.is_empty()));
+        if let Some(sdk_path) = sdk_path {
+            bindings_builder = bindings_builder
+                .clang_arg(format!("--target={}", apple_clang_target(&target_triple)))
+                .clang_arg("-isysroot")
+                .clang_arg(sdk_path);
+        } else {
+            println!(
+                "cargo:warning=Apple SDK path unavailable; bindgen may fail to find system headers"
+            );
+        }
     }
 
     // Configure Android-specific bindgen settings
@@ -626,8 +773,21 @@ fn main() {
         if build_shared_libs { "ON" } else { "OFF" },
     );
 
-    if matches!(target_os, TargetOs::Apple(_)) {
+    if let TargetOs::Apple(variant) = &target_os {
         config.define("GGML_BLAS", "OFF");
+        let sdk_name = apple_sdk_name(&target_triple, variant);
+        if let Some(sdk_path) = xcrun_sdk_path(sdk_name) {
+            config.define("CMAKE_OSX_SYSROOT", sdk_path);
+        }
+        if let Some(deployment_target) = apple_deployment_target(&target_triple) {
+            config.define("CMAKE_OSX_DEPLOYMENT_TARGET", deployment_target);
+        }
+        if let Some(clang) = xcrun_find_tool("clang") {
+            config.define("CMAKE_C_COMPILER", clang);
+        }
+        if let Some(clangxx) = xcrun_find_tool("clang++") {
+            config.define("CMAKE_CXX_COMPILER", clangxx);
+        }
     }
 
     if (matches!(target_os, TargetOs::Windows(WindowsVariant::Msvc))
@@ -999,6 +1159,7 @@ fn main() {
     assert_ne!(llama_libs.len(), 0);
 
     let common_lib_dir = out_dir.join("build").join("common");
+    let common_base_lib_available = common_lib_dir.join("libllama-common-base.a").is_file();
     if common_lib_dir.is_dir() {
         println!(
             "cargo:rustc-link-search=native={}",
@@ -1011,7 +1172,6 @@ fn main() {
                 common_profile_dir.display()
             );
         }
-        println!("cargo:rustc-link-lib=static=common");
     }
 
     if cfg!(feature = "system-ggml") {
@@ -1023,6 +1183,9 @@ fn main() {
         let link = format!("cargo:rustc-link-lib={}={}", llama_libs_kind, lib);
         debug_log!("LINK {link}",);
         println!("{link}",);
+    }
+    if common_base_lib_available {
+        println!("cargo:rustc-link-lib=static=llama-common-base");
     }
 
     // OpenMP

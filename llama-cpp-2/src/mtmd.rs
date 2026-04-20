@@ -196,10 +196,7 @@ impl MtmdContext {
     #[must_use]
     pub fn decode_use_non_causal(&self) -> bool {
         unsafe {
-            llama_cpp_sys_2::mtmd_decode_use_non_causal(
-                self.context.as_ptr(),
-                std::ptr::null(),
-            )
+            llama_cpp_sys_2::mtmd_decode_use_non_causal(self.context.as_ptr(), std::ptr::null())
         }
     }
 
@@ -207,10 +204,7 @@ impl MtmdContext {
     #[must_use]
     pub fn decode_use_non_causal_for_chunk(&self, chunk: &MtmdInputChunk) -> bool {
         unsafe {
-            llama_cpp_sys_2::mtmd_decode_use_non_causal(
-                self.context.as_ptr(),
-                chunk.chunk.as_ptr(),
-            )
+            llama_cpp_sys_2::mtmd_decode_use_non_causal(self.context.as_ptr(), chunk.chunk.as_ptr())
         }
     }
 
