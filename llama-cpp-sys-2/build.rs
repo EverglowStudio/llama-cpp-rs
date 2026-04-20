@@ -20,6 +20,7 @@ enum TargetOs {
     Apple(AppleVariant),
     Linux,
     Android,
+    Ohos,
 }
 
 macro_rules! debug_log {
@@ -53,6 +54,8 @@ fn parse_target_os() -> Result<(TargetOs, String), String> {
     {
         // Handle both full android targets and short names like arm64-v8a that cargo ndk might use
         Ok((TargetOs::Android, target))
+    } else if target.contains("ohos") {
+        Ok((TargetOs::Ohos, target))
     } else if target.contains("linux") {
         Ok((TargetOs::Linux, target))
     } else {
@@ -80,7 +83,7 @@ fn extract_lib_names(out_dir: &Path, build_shared_libs: bool, target_os: &Target
                 "*.a"
             }
         }
-        TargetOs::Linux | TargetOs::Android => {
+        TargetOs::Linux | TargetOs::Android | TargetOs::Ohos => {
             if build_shared_libs {
                 "*.so"
             } else {
@@ -125,7 +128,7 @@ fn extract_lib_assets(out_dir: &Path, target_os: &TargetOs) -> Vec<PathBuf> {
     let shared_lib_pattern = match target_os {
         TargetOs::Windows(_) => "*.dll",
         TargetOs::Apple(_) => "*.dylib",
-        TargetOs::Linux | TargetOs::Android => "*.so",
+        TargetOs::Linux | TargetOs::Android | TargetOs::Ohos => "*.so",
     };
 
     let shared_libs_dir = match target_os {
@@ -306,6 +309,196 @@ fn validate_android_ndk(ndk_path: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn ohos_ndk_home() -> String {
+    println!("cargo:rerun-if-env-changed=OHOS_NDK_HOME");
+    let ndk = env::var("OHOS_NDK_HOME").unwrap_or_else(|_| {
+        panic!(
+            "OHOS_NDK_HOME not found. Set it to the OpenHarmony native SDK root before building for OHOS"
+        )
+    });
+    if !Path::new(&ndk).exists() {
+        panic!("OHOS_NDK_HOME does not exist: {ndk}");
+    }
+    ndk
+}
+
+fn ohos_c_target(target_triple: &str) -> &'static str {
+    if target_triple.contains("aarch64") {
+        "aarch64-linux-ohos"
+    } else if target_triple.contains("armv7") {
+        "arm-linux-ohos"
+    } else if target_triple.contains("x86_64") {
+        "x86_64-linux-ohos"
+    } else {
+        panic!("Unsupported OHOS target: {target_triple}");
+    }
+}
+
+fn ohos_arch_abi(target_triple: &str) -> &'static str {
+    if target_triple.contains("aarch64") {
+        "arm64-v8a"
+    } else if target_triple.contains("armv7") {
+        "armeabi-v7a"
+    } else if target_triple.contains("x86_64") {
+        "x86_64"
+    } else {
+        panic!("Unsupported OHOS target: {target_triple}");
+    }
+}
+
+fn ohos_toolchain_bin(ndk: &str) -> PathBuf {
+    Path::new(ndk).join("native").join("llvm").join("bin")
+}
+
+fn ohos_toolchain_file(ndk: &str) -> PathBuf {
+    Path::new(ndk)
+        .join("native")
+        .join("build")
+        .join("cmake")
+        .join("ohos.toolchain.cmake")
+}
+
+fn ohos_sysroot(ndk: &str) -> PathBuf {
+    Path::new(ndk).join("native").join("sysroot")
+}
+
+fn ohos_clang_builtin_includes(ndk: &str) -> Option<PathBuf> {
+    let clang_lib = Path::new(ndk)
+        .join("native")
+        .join("llvm")
+        .join("lib")
+        .join("clang");
+    std::fs::read_dir(&clang_lib).ok().and_then(|entries| {
+        entries
+            .filter_map(|entry| entry.ok())
+            .find(|entry| {
+                entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                    && entry
+                        .file_name()
+                        .to_str()
+                        .map(|name| name.chars().next().unwrap_or('0').is_ascii_digit())
+                        .unwrap_or(false)
+            })
+            .map(|entry| entry.path().join("include"))
+            .filter(|path| path.exists())
+    })
+}
+
+fn ohos_compiler_flags(ndk: &str, target_triple: &str) -> Vec<String> {
+    let c_target = ohos_c_target(target_triple);
+    let sysroot = ohos_sysroot(ndk);
+    let mut flags = vec![
+        format!("--target={c_target}"),
+        format!("--sysroot={}", sysroot.display()),
+        "-D__MUSL__".to_string(),
+        "-D__OHOS__".to_string(),
+    ];
+    if target_triple.contains("armv7") {
+        flags.extend([
+            "-march=armv7-a".to_string(),
+            "-mfloat-abi=softfp".to_string(),
+            "-mthumb".to_string(),
+        ]);
+    }
+    flags
+}
+
+fn configure_ohos_toolchain_env(target_triple: &str) {
+    let ndk = ohos_ndk_home();
+    let bin = ohos_toolchain_bin(&ndk);
+    env::set_var("CC", bin.join("clang"));
+    env::set_var("CXX", bin.join("clang++"));
+    env::set_var("AR", bin.join("llvm-ar"));
+    env::set_var("RANLIB", bin.join("llvm-ranlib"));
+    env::set_var("CXXSTDLIB", "c++");
+    env::set_var(
+        "BINDGEN_EXTRA_CLANG_ARGS",
+        ohos_compiler_flags(&ndk, target_triple).join(" "),
+    );
+}
+
+fn configure_ohos_bindgen(mut builder: bindgen::Builder, target_triple: &str) -> bindgen::Builder {
+    let ndk = ohos_ndk_home();
+    for flag in ohos_compiler_flags(&ndk, target_triple) {
+        builder = builder.clang_arg(flag);
+    }
+    let sysroot = ohos_sysroot(&ndk);
+    if let Some(builtin_includes) = ohos_clang_builtin_includes(&ndk) {
+        builder = builder
+            .clang_arg("-isystem")
+            .clang_arg(builtin_includes.to_string_lossy().to_string());
+    }
+    builder
+        .clang_arg("-isystem")
+        .clang_arg(
+            sysroot
+                .join("usr")
+                .join("include")
+                .join(ohos_c_target(target_triple))
+                .to_string_lossy()
+                .to_string(),
+        )
+        .clang_arg("-isystem")
+        .clang_arg(
+            sysroot
+                .join("usr")
+                .join("include")
+                .to_string_lossy()
+                .to_string(),
+        )
+        .clang_arg("-include")
+        .clang_arg("stdbool.h")
+        .clang_arg("-include")
+        .clang_arg("stdint.h")
+}
+
+fn configure_ohos_cc_build(build: &mut cc::Build, target_triple: &str) {
+    let ndk = ohos_ndk_home();
+    for flag in ohos_compiler_flags(&ndk, target_triple) {
+        build.flag(flag);
+    }
+}
+
+fn ohos_needs_pthread_affinity_shim(target_triple: &str) -> bool {
+    target_triple.contains("x86_64")
+}
+
+fn write_ohos_pthread_affinity_shim(out_dir: &Path) -> PathBuf {
+    let shim = out_dir.join("ohos-pthread-affinity-shim.h");
+    std::fs::write(
+        &shim,
+        r#"#ifndef LLAMA_CPP_SYS_2_OHOS_PTHREAD_AFFINITY_SHIM_H
+#define LLAMA_CPP_SYS_2_OHOS_PTHREAD_AFFINITY_SHIM_H
+
+#if defined(__OHOS__)
+#include <pthread.h>
+#include <stddef.h>
+
+static inline int llama_cpp_sys_2_ohos_pthread_setaffinity_np(pthread_t thread, size_t cpusetsize, const void *cpuset) {
+    (void) thread;
+    (void) cpusetsize;
+    (void) cpuset;
+    return -1;
+}
+
+static inline int llama_cpp_sys_2_ohos_pthread_getaffinity_np(pthread_t thread, size_t cpusetsize, void *cpuset) {
+    (void) thread;
+    (void) cpusetsize;
+    (void) cpuset;
+    return -1;
+}
+
+#define pthread_setaffinity_np llama_cpp_sys_2_ohos_pthread_setaffinity_np
+#define pthread_getaffinity_np llama_cpp_sys_2_ohos_pthread_getaffinity_np
+#endif
+
+#endif
+"#,
+    )
+    .unwrap_or_else(|err| panic!("failed to write OHOS pthread affinity shim: {err}"));
+    shim
+}
+
 fn is_hidden(e: &DirEntry) -> bool {
     e.file_name()
         .to_str()
@@ -360,6 +553,9 @@ fn main() {
             sdk_path.as_deref(),
             deployment_target.as_deref(),
         );
+    }
+    if matches!(target_os, TargetOs::Ohos) {
+        configure_ohos_toolchain_env(&target_triple);
     }
 
     // Make sure that changes to the llama.cpp project trigger a rebuild.
@@ -435,6 +631,9 @@ fn main() {
                 "cargo:warning=Apple SDK path unavailable; bindgen may fail to find system headers"
             );
         }
+    }
+    if matches!(target_os, TargetOs::Ohos) {
+        bindings_builder = configure_ohos_bindgen(bindings_builder, &target_triple);
     }
 
     // Configure Android-specific bindgen settings
@@ -665,6 +864,9 @@ fn main() {
     if matches!(target_os, TargetOs::Android) && cfg!(feature = "static-stdcxx") {
         common_wrapper_build.cpp_link_stdlib(None);
     }
+    if matches!(target_os, TargetOs::Ohos) {
+        configure_ohos_cc_build(&mut common_wrapper_build, &target_triple);
+    }
 
     common_wrapper_build.compile("llama_cpp_sys_2_common_wrapper");
 
@@ -787,6 +989,32 @@ fn main() {
         }
         if let Some(clangxx) = xcrun_find_tool("clang++") {
             config.define("CMAKE_CXX_COMPILER", clangxx);
+        }
+    }
+    if matches!(target_os, TargetOs::Ohos) {
+        let ndk = ohos_ndk_home();
+        let toolchain_file = ohos_toolchain_file(&ndk);
+        if !toolchain_file.exists() {
+            panic!(
+                "OHOS CMake toolchain file not found: {}",
+                toolchain_file.display()
+            );
+        }
+        config.define("CMAKE_TOOLCHAIN_FILE", toolchain_file);
+        config.define("OHOS_ARCH", ohos_arch_abi(&target_triple));
+        config.define(
+            "OHOS_PLATFORM_LEVEL",
+            env::var("OHOS_PLATFORM_LEVEL").unwrap_or_else(|_| "12".to_string()),
+        );
+        config.define("OHOS_STL", "c++_shared");
+        config.define("GGML_LLAMAFILE", "OFF");
+        if ohos_needs_pthread_affinity_shim(&target_triple) {
+            let affinity_shim = write_ohos_pthread_affinity_shim(&out_dir);
+            let affinity_shim = affinity_shim.to_string_lossy().to_string();
+            config.cflag("-include");
+            config.cflag(&affinity_shim);
+            config.cxxflag("-include");
+            config.cxxflag(&affinity_shim);
         }
     }
 
@@ -970,7 +1198,7 @@ fn main() {
     // Android doesn't have OpenMP support AFAICT and openmp is a default feature. Do this here
     // rather than modifying the defaults in Cargo.toml just in case someone enables the OpenMP feature
     // and tries to build for Android anyway.
-    if cfg!(feature = "openmp") && !matches!(target_os, TargetOs::Android) {
+    if cfg!(feature = "openmp") && !matches!(target_os, TargetOs::Android | TargetOs::Ohos) {
         config.define("GGML_OPENMP", "ON");
     } else {
         config.define("GGML_OPENMP", "OFF");
@@ -984,7 +1212,7 @@ fn main() {
     config
         .profile(&profile)
         .very_verbose(std::env::var("CMAKE_VERBOSE").is_ok()) // Not verbose by default
-        .always_configure(false);
+        .always_configure(matches!(target_os, TargetOs::Ohos));
 
     let build_dir = config.build();
 
@@ -1014,6 +1242,9 @@ fn main() {
         // C++ stdlib linking (which defaults to c++_shared) so we can link c++_static instead.
         if matches!(target_os, TargetOs::Android) && cfg!(feature = "static-stdcxx") {
             mtmd_build.cpp_link_stdlib(None);
+        }
+        if matches!(target_os, TargetOs::Ohos) {
+            configure_ohos_cc_build(&mut mtmd_build, &target_triple);
         }
 
         // Collect all .cpp files in tools/mtmd and its subdirectories
@@ -1240,6 +1471,10 @@ fn main() {
             }
             // When neither feature is set, the cc crate handles C++ stdlib
             // linking automatically (defaults to c++_shared on Android).
+        }
+        TargetOs::Ohos => {
+            println!("cargo:rustc-link-lib=c++");
+            println!("cargo:rustc-link-lib=unwind");
         }
         _ => (),
     }
