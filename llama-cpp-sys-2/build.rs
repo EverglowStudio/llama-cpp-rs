@@ -247,6 +247,173 @@ fn xcrun_find_tool(tool: &str) -> Option<String> {
     }
 }
 
+fn ensure_opencl_header_layout(source_headers: &Path, out_dir: &Path) -> Result<PathBuf, String> {
+    let source_cl = source_headers.join("CL").join("cl.h");
+    if source_cl.exists() {
+        return Ok(source_headers.to_path_buf());
+    }
+
+    let source_flat = source_headers.join("cl.h");
+    if !source_flat.exists() {
+        return Err(format!(
+            "OpenCL headers not found under {}; expected CL/cl.h or cl.h",
+            source_headers.display()
+        ));
+    }
+
+    let staged_root = out_dir.join("opencl-headers");
+    let staged_cl = staged_root.join("CL");
+    std::fs::create_dir_all(&staged_cl).map_err(|error| {
+        format!(
+            "failed to create staged OpenCL headers at {}: {error}",
+            staged_cl.display()
+        )
+    })?;
+
+    for entry in std::fs::read_dir(source_headers).map_err(|error| {
+        format!(
+            "failed to read OpenCL headers from {}: {error}",
+            source_headers.display()
+        )
+    })? {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to inspect OpenCL header entry in {}: {error}",
+                source_headers.display()
+            )
+        })?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(file_name) = path.file_name() else {
+            continue;
+        };
+        let dest = staged_cl.join(file_name);
+        std::fs::copy(&path, &dest).map_err(|error| {
+            format!(
+                "failed to stage OpenCL header {} -> {}: {error}",
+                path.display(),
+                dest.display()
+            )
+        })?;
+    }
+
+    Ok(staged_root)
+}
+
+fn android_ndk_opencl_headers_dir() -> Option<PathBuf> {
+    let ndk_roots = [
+        "ANDROID_NDK_HOME",
+        "ANDROID_NDK_ROOT",
+        "ANDROID_NDK",
+        "NDK_ROOT",
+    ];
+
+    for key in ndk_roots {
+        println!("cargo:rerun-if-env-changed={key}");
+        let Ok(root) = env::var(key) else {
+            continue;
+        };
+        if root.trim().is_empty() {
+            continue;
+        }
+        let headers = Path::new(&root)
+            .join("toolchains")
+            .join("llvm")
+            .join("prebuilt");
+        let Ok(prebuilts) = std::fs::read_dir(&headers) else {
+            continue;
+        };
+        for prebuilt in prebuilts.flatten() {
+            let path = prebuilt.path().join("sysroot").join("usr").join("include");
+            if path.join("CL").join("cl.h").exists() {
+                return Some(path);
+            }
+        }
+    }
+
+    None
+}
+
+fn resolve_android_opencl_headers_dir(out_dir: &Path) -> Result<PathBuf, String> {
+    println!("cargo:rerun-if-env-changed=ANDROID_OPENCL_HEADERS_DIR");
+
+    if let Ok(headers) = env::var("ANDROID_OPENCL_HEADERS_DIR") {
+        if !headers.trim().is_empty() {
+            let headers = PathBuf::from(headers);
+            return ensure_opencl_header_layout(&headers, out_dir);
+        }
+    }
+
+    if let Some(headers) = android_ndk_opencl_headers_dir() {
+        return ensure_opencl_header_layout(&headers, out_dir);
+    }
+
+    Err(
+        "Android OpenCL build requires Khronos OpenCL headers via ANDROID_OPENCL_HEADERS_DIR or an NDK sysroot patched with OpenCL-Headers"
+            .into(),
+    )
+}
+
+fn resolve_android_opencl_library() -> Result<PathBuf, String> {
+    println!("cargo:rerun-if-env-changed=ANDROID_OPENCL_LIBRARY");
+    println!("cargo:rerun-if-env-changed=ANDROID_OPENCL_LIB");
+    println!("cargo:rerun-if-env-changed=ANDROID_OPENCL_LIB_DIR");
+
+    if let Ok(path) = env::var("ANDROID_OPENCL_LIBRARY") {
+        if path.trim().is_empty() {
+            // Keep looking through the remaining env conventions.
+        } else {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "ANDROID_OPENCL_LIBRARY does not exist: {}",
+            path.display()
+        ));
+        }
+    }
+
+    if let Ok(path) = env::var("ANDROID_OPENCL_LIB") {
+        if path.trim().is_empty() {
+            // Keep looking through the remaining env conventions.
+        } else {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "ANDROID_OPENCL_LIB does not exist: {}",
+            path.display()
+        ));
+        }
+    }
+
+    if let Ok(dir) = env::var("ANDROID_OPENCL_LIB_DIR") {
+        if dir.trim().is_empty() {
+            return Err(
+                "Android OpenCL build requires ANDROID_OPENCL_LIBRARY, ANDROID_OPENCL_LIB, or ANDROID_OPENCL_LIB_DIR"
+                    .into(),
+            );
+        }
+        let path = Path::new(&dir).join("libOpenCL.so");
+        if path.exists() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "ANDROID_OPENCL_LIB_DIR does not contain libOpenCL.so: {}",
+            path.display()
+        ));
+    }
+
+    Err(
+        "Android OpenCL build requires ANDROID_OPENCL_LIBRARY, ANDROID_OPENCL_LIB, or ANDROID_OPENCL_LIB_DIR"
+            .into(),
+    )
+}
+
 fn clear_stale_apple_cmake_cache(
     out_dir: &Path,
     expected_c_compiler: Option<&str>,
@@ -281,6 +448,46 @@ fn clear_stale_apple_cmake_cache(
         if let Err(error) = std::fs::remove_dir_all(&build_dir) {
             println!(
                 "cargo:warning=failed to remove stale Apple CMake cache at {}: {error}",
+                build_dir.display()
+            );
+        }
+    }
+}
+
+fn clear_stale_android_opencl_cmake_cache(
+    out_dir: &Path,
+    expected_headers_dir: &Path,
+    expected_library: &Path,
+) {
+    let build_dir = out_dir.join("build");
+    let cache_path = build_dir.join("CMakeCache.txt");
+    let Ok(cache) = std::fs::read_to_string(&cache_path) else {
+        return;
+    };
+
+    let headers_matches = cache.contains(&format!(
+        "OpenCL_INCLUDE_DIR:UNINITIALIZED={}",
+        expected_headers_dir.display()
+    )) || cache.contains(&format!(
+        "OpenCL_INCLUDE_DIR:PATH={}",
+        expected_headers_dir.display()
+    ));
+    let library_matches = cache.contains(&format!(
+        "OpenCL_LIBRARY:UNINITIALIZED={}",
+        expected_library.display()
+    )) || cache.contains(&format!(
+        "OpenCL_LIBRARY:FILEPATH={}",
+        expected_library.display()
+    ));
+
+    if !headers_matches || !library_matches {
+        println!(
+            "cargo:warning=removing stale Android OpenCL CMake cache at {}",
+            build_dir.display()
+        );
+        if let Err(error) = std::fs::remove_dir_all(&build_dir) {
+            println!(
+                "cargo:warning=failed to remove stale Android OpenCL CMake cache at {}: {error}",
                 build_dir.display()
             );
         }
@@ -552,6 +759,17 @@ fn main() {
             clang_path.as_deref(),
             sdk_path.as_deref(),
             deployment_target.as_deref(),
+        );
+    }
+    if matches!(target_os, TargetOs::Android) && cfg!(feature = "opencl") {
+        let android_opencl_headers = resolve_android_opencl_headers_dir(&out_dir)
+            .unwrap_or_else(|error| panic!("failed to resolve Android OpenCL headers: {error}"));
+        let android_opencl_library = resolve_android_opencl_library()
+            .unwrap_or_else(|error| panic!("failed to resolve Android OpenCL library: {error}"));
+        clear_stale_android_opencl_cmake_cache(
+            &out_dir,
+            &android_opencl_headers,
+            &android_opencl_library,
         );
     }
     if matches!(target_os, TargetOs::Ohos) {
@@ -1139,6 +1357,8 @@ fn main() {
         println!("cargo:rustc-link-lib=android");
     }
 
+    let mut opencl_library_path: Option<PathBuf> = None;
+
     if matches!(target_os, TargetOs::Linux)
         && target_triple.contains("aarch64")
         && target_cpu != Some("native".into())
@@ -1180,6 +1400,25 @@ fn main() {
                 println!("cargo:rustc-link-lib=vulkan");
             }
             _ => (),
+        }
+    }
+
+    if cfg!(feature = "opencl") {
+        config.define("GGML_OPENCL", "ON");
+        config.define("GGML_OPENCL_EMBED_KERNELS", "ON");
+        config.define("GGML_OPENCL_USE_ADRENO_KERNELS", "ON");
+
+        if matches!(target_os, TargetOs::Android) {
+            let opencl_headers = resolve_android_opencl_headers_dir(&out_dir)
+                .unwrap_or_else(|error| panic!("failed to resolve Android OpenCL headers: {error}"));
+            let opencl_library = resolve_android_opencl_library()
+                .unwrap_or_else(|error| panic!("failed to resolve Android OpenCL library: {error}"));
+            config.define(
+                "OpenCL_INCLUDE_DIR",
+                opencl_headers.to_string_lossy().to_string(),
+            );
+            config.define("OpenCL_LIBRARY", opencl_library.to_string_lossy().to_string());
+            opencl_library_path = Some(opencl_library);
         }
     }
 
@@ -1374,6 +1613,15 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=amdhip64");
         println!("cargo:rustc-link-lib=dylib=rocblas");
         println!("cargo:rustc-link-lib=dylib=hipblas");
+    }
+
+    if cfg!(feature = "opencl") {
+        if let Some(opencl_library) = &opencl_library_path {
+            if let Some(parent) = opencl_library.parent() {
+                println!("cargo:rustc-link-search=native={}", parent.display());
+            }
+        }
+        println!("cargo:rustc-link-lib=dylib=OpenCL");
     }
 
     // Link libraries

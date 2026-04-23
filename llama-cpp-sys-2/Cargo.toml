@@ -49,6 +49,7 @@ include = [
     "/llama.cpp/ggml/src/ggml-cpu/**/*",
     "/llama.cpp/ggml/src/ggml-cuda/**/*",
     "/llama.cpp/ggml/src/ggml-metal/**/*",
+    "/llama.cpp/ggml/src/ggml-opencl/**/*",
     "/llama.cpp/ggml/src/ggml-vulkan/**/*",
     "/llama.cpp/ggml/src/ggml-hip/**/*",
 
@@ -86,6 +87,7 @@ cuda = []
 # Disables the need to dynamically link against libcuda.so / cuda.dll
 cuda-no-vmm = ["cuda"]
 metal = []
+opencl = []
 dynamic-link = []
 vulkan = []
 openmp = []
