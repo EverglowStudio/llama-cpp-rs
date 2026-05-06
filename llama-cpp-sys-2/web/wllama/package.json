@@ -1,0 +1,104 @@
+{
+  "name": "@reeselevine/wllama-webgpu",
+  "version": "1.0.0-alpha.2",
+  "description": "WebAssembly binding for llama.cpp - Enabling on-browser LLM inference",
+  "main": "./esm/index.cjs",
+  "module": "./esm/index.js",
+  "types": "./esm/index.d.ts",
+  "type": "module",
+  "files": [
+    "esm/",
+    "src/jspi-single-thread/wllama.wasm",
+    "src/jspi-multi-thread/wllama.wasm",
+    "src/asyncify-single-thread/wllama.wasm",
+    "src/asyncify-multi-thread/wllama.wasm",
+    "src/wasm-from-package.js",
+    "src/wasm-from-package.d.ts",
+    "README.md",
+    "LICENCE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./esm/index.d.ts",
+      "import": "./esm/index.js",
+      "require": "./esm/index.cjs"
+    },
+    "./esm/wasm-from-cdn.js": {
+      "types": "./esm/wasm-from-cdn.d.ts",
+      "import": "./esm/wasm-from-cdn.js",
+      "require": "./esm/wasm-from-cdn.cjs"
+    },
+    "./esm/wasm-from-package.js": {
+      "types": "./src/wasm-from-package.d.ts",
+      "import": "./src/wasm-from-package.js"
+    },
+    "./src/jspi-single-thread/wllama.wasm": "./src/jspi-single-thread/wllama.wasm",
+    "./src/jspi-multi-thread/wllama.wasm": "./src/jspi-multi-thread/wllama.wasm",
+    "./src/asyncify-single-thread/wllama.wasm": "./src/asyncify-single-thread/wllama.wasm",
+    "./src/asyncify-multi-thread/wllama.wasm": "./src/asyncify-multi-thread/wllama.wasm",
+    "./package.json": "./package.json"
+  },
+  "directories": {
+    "example": "examples"
+  },
+  "scripts": {
+    "serve": "node ./scripts/http_server.js",
+    "serve:mt": "MULTITHREAD=1 node ./scripts/http_server.js",
+    "clean": "rm -rf ./esm && rm -rf ./docs && rm -rf ./wasm",
+    "build:worker": "./scripts/build_worker.sh",
+    "build:glue": "node ./cpp/generate_glue_prototype.js",
+    "build:wasm": "./scripts/build_wasm.sh && npm run build:glue",
+    "build:tsup": "tsup --config tsup.config.ts",
+    "build:minified": "terser esm/index.js -o esm/index.min.js --compress --mangle --source-map",
+    "build:typedef": "tsc --emitDeclarationOnly --declaration -p tsconfig.build.json",
+    "build": "npm run clean && npm run build:worker && npm run build:tsup && npm run build:minified && npm run build:typedef",
+    "postbuild": "./scripts/post_build.sh && npm run docs",
+    "docs": "typedoc --tsconfig tsconfig.build.json src/index.ts",
+    "upload": "npm run format && npm run build && npm publish --access public",
+    "format": "prettier --write .",
+    "test": "vitest",
+    "test:firefox": "BROWSER=firefox vitest",
+    "test:safari": "BROWSER=safari vitest"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/reeselevine/wllama.git"
+  },
+  "keywords": [
+    "wasm",
+    "webassembly",
+    "llama",
+    "llm",
+    "ai",
+    "rag",
+    "embeddings",
+    "generation"
+  ],
+  "author": "Reese Levine",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/reeselevine/wllama/issues"
+  },
+  "homepage": "https://github.com/reeselevine/wllama#readme",
+  "devDependencies": {
+    "@vitest/browser": "^2.1.6",
+    "@webgpu/types": "^0.1.68",
+    "express": "^4.18.3",
+    "mime-types": "^2.1.35",
+    "playwright": "^1.49.0",
+    "prettier": "^3.3.3",
+    "terser": "^5.39.0",
+    "tsup": "^8.4.0",
+    "typedoc": "^0.27.2",
+    "typescript": "^5.4.2",
+    "webdriverio": "^9.4.1"
+  },
+  "prettier": {
+    "trailingComma": "es5",
+    "tabWidth": 2,
+    "semi": true,
+    "singleQuote": true,
+    "bracketSameLine": false
+  },
+  "dependencies": {}
+}
